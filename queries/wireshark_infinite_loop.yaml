@@ -1,0 +1,150 @@
+---
+- DESCRIPTION: |-
+    Look for a for statement with an increment based on user input.  Based on this bug:
+    
+    https://anonsvn.wireshark.org/viewvc/trunk/epan/dissectors/packet-assa_r3.c?r1=51196&r2=51195&pathrev=51196
+
+  QUERY: |-
+    getNodesWithType("ForStatement")
+      .children()
+      .filter { it.type == "AssignmentExpr" }
+      .filter { it.rval().code.toList()[0].matches(".*tvb_get_.*") }
+
+  POSITIVE_TESTS:
+    - |-
+      main() {
+        for (i = 0; i < len; i += tvb_get_guint8(tvb, i)) {
+        }
+      }
+
+  NEGATIVE_TESTS:
+
+- DESCRIPTION: |-
+    More generically, Wireshark dissectors normally update their position in a packet/stream in
+    a variable named offset as they process. There are a number of previous infinite loop DoS
+    vulnerabilities based on the offset being incremented in a loop by user-controlled data set
+    to 0 or being able to wrap around the offset variable in a loop, for example:
+    https://code.wireshark.org/review/#/c/5338/2/epan/dissectors/packet-tn5250.c
+
+    Check a value that comes from tvb_get_* is later added to the offset variable in a loop.
+
+    Limitations:
+     + Assumes an assignment, does not work for offset += tvb_...
+
+  QUERY: |-
+    getFunctionsByName("tvb_get_*").transform { getCallsTo(it.name) }.scatter()
+      .statements()
+      .filter { it.defines().count() > 0 }
+      .sideEffect { output_var_name = it.defines().toList()[-1].code }
+      .out("REACHES")
+      .match { it.type == "AssignmentExpr" }
+      .and(
+        _().lval().match { it.code.matches(".*[oO]ff.*") },
+        _().rval().filter { it.type != "CallExpression" }.match { it.code == output_var_name })
+      .dedup()
+      .filter { isInLoop(it) }
+
+  POSITIVE_TESTS:
+    - |-
+      tvb_get_ntohl() {}      // Declaration required to be able to search for functions by name in the index
+      main() {
+        while(1) {
+          guint32 len = tvb_get_ntohl(tvb, offset);
+          offset += len;
+        }
+      }
+
+  NEGATIVE_TESTS:
+    - |-
+      tvb_get_ntohl() {}      // Declaration required to be able to search for functions by name in the index
+      main() {
+        guint32 len = tvb_get_ntohl(tvb, offset);
+        offset += len;
+      }
+
+- DESCRIPTION: |-
+    The above is a good start, but it turns out that many core Wireshark functions check bounds
+    for the offset so there is an unacceptable number of false-positives. There are two types
+    of bugs the above query could find: 1) infinite loops caused by loops updating the offset
+    using only user supplied input [e.g. no constants are added], or 2) infinite loops caused
+    by integer overflows to the offset variable, causing the loop to start processing at the
+    beginning of the last iteration. This query looks for the latter.
+
+    There is an 'unsanitized' joern step that allows you to pick a statement in the CFG and
+    find all paths in the CFG to that statement where user input has not been sanitized. We
+    would like to do the opposite, start from a call to tvb_get_*, end at a statement that
+    adds that value to the offset, and make sure the argument has not been passed to a
+    bounds-checking function in between. We can do this by using the 'cfgPaths' step (which is
+    used by 'unsanitized' step.) This allows us specify a source and a destination statement,
+    along with a closure expressing what 'sanitizing' statements look like, and receive any
+    paths from the source to the destination where a given set of sanitizing statements are
+    avoided.
+
+    Since we are interested in integer overflows, we only care to target functions that return
+    32-bit or 64-bit integers. Afterwards we use slightly more complex logic to find instances
+    where that tainted user input is added to an offset variable, and then perform the cfgPaths
+    sanitization search.
+
+    This query found the following bugs:
+     + https://bugs.wireshark.org/bugzilla/show_bug.cgi?id=11023
+     + https://bugs.wireshark.org/bugzilla/show_bug.cgi?id=11024
+     + https://bugs.wireshark.org/bugzilla/show_bug.cgi?id=11037
+
+    Limitations:
+     + Assumes an assignment, fails for offset += tvb_...
+     + Assumes a call to proto_tree_add_item/etc sanitizes, but it might miss cases where the
+       tainted value is added to something [e.g. proto_tree_add_item(tained + 4) allowing an
+       integer overflow to bypass the bounds checking]
+     + The tainted user data might be passed as an argument to a sanitizing functions so that
+       it does not cause a bound check, we should check specific parameters.
+
+  QUERY: |-
+    getFunctionsByName("tvb_get_*").as('func').out("IS_FUNCTION_OF_AST").out.filter { it.type == "ReturnType" }.filter { it.code.matches(".*int(32|64).*") }.back('func')
+      .transform { getCallsTo(it.name) }.scatter()
+      .sideEffect { src = it }
+      .statements()
+      .filter { it.defines().count() > 0 }
+      .sideEffect { output_var_name = it.defines().code.toList()[0].replace("*", "") }
+      .out("REACHES")
+      .match { it.type == "AssignmentExpr" }
+      .filter { it.rval().toList()[0].code.matches(".*$output_var_name.*") }
+      .filter { it.rval().toList()[0].type != 'CallExpression' }
+      // The following is to get around null accesses stemming from:
+      // https://github.com/fabsx00/joern/issues/49
+      .filter { it.parents().toList()[0].type != "IdentifierDecl" }
+      .filter { lval = it.lval().toList()[0]; lval.code == 'offset' || (src.ithArguments("1").toList()[0].code != 'offset' && lval.code.matches(".*[oO]ff.*")) }
+      .dedup()
+      .filter { isInLoop(it) }
+      .sideEffect { dst = it }
+      .transform { cfgPaths(output_var_name, { cur, sym ->
+        cur._().filter { it.uses().code.toList().contains(output_var_name) }.or(
+          _().codeContains('.*proto_tree_add_(text|item).*'),
+          _().codeContains('.*tvb_get_(str|ptr).*'),
+          _().codeContains('.*tvb_new_subset.*'),
+          _().codeContains('.*tlv_length_remaining.*'))
+        }, src.statements().toList()[0], dst.statements().toList()[0]) }
+      .scatter().transform { it.toList()[0] }
+      .dedup()
+
+  POSITIVE_TESTS:
+    - |-
+      guint32 tvb_get_ntohl() {}      // Declaration required to be able to search for functions by name in the index
+      main() {
+        guint32 len;
+        while(1) {
+          len = tvb_get_ntohl(tvb, offset);
+          offset += len;
+        }
+      }
+
+  NEGATIVE_TESTS:
+    - |-
+      guint32 tvb_get_ntohl() {}      // Declaration required to be able to search for functions by name in the index
+      main() {
+        guint32 len;
+        while(1) {
+          len = tvb_get_ntohl(tvb, offset);
+          proto_tree_add_text(len); // Sanitizer!
+          offset += len;
+        }
+      }
