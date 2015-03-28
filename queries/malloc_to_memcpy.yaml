@@ -4,7 +4,7 @@
     malloc (e.g. len+1) is different from the additive expression used in the length argument
     directly following it's next use; this indicates a potential integer overflow.
 
-    LIMITATIONS: Only additive expressions, doesn't work for cases where one of the statements
+    Limitations: Only additive expressions, doesn't work for cases where one of the statements
     is not an additive expression [e.g. malloc(len+1) -> memcpy(.., len);]
   QUERY: |-
     getCallsTo("malloc").ithArguments("0")
@@ -34,7 +34,7 @@
     potentially multiple constants/operations), and a later memcpy involving only the same
     single variable with a different expression.
 
-    LIMITATIONS: Only catches cases where a single identifier is used in the expression for the
+    Limitations: Only catches cases where a single identifier is used in the expression for the
     allocation, this means multiple variables (or even addition with the result of a function
     call or a macro) will not show up.
 
