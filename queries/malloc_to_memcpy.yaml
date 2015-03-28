@@ -1,0 +1,64 @@
+---
+- DESCRIPTION: |-
+    Fabian's example from his 31c3 talk. Find cases where an additive expression used for a
+    malloc (e.g. len+1) is different from the additive expression used in the length argument
+    directly following it's next use; this indicates a potential integer overflow.
+
+    LIMITATIONS: Only additive expressions, doesn't work for cases where one of the statements
+    is not an additive expression [e.g. malloc(len+1) -> memcpy(.., len);]
+  QUERY: |-
+    getCallsTo("malloc").ithArguments("0")
+      .sideEffect { cnt = it.code }
+      .match { it.type == "AdditiveExpression" }.statements()
+      .out("REACHES")
+      .match { it.type == "CallExpression" && it.code.startsWith("memcpy") }.ithArguments("2") 
+      .filter { it.code != cnt }
+      .match { it.type == "AdditiveExpression" }
+  POSITIVE_TESTS:
+    - |-
+      main() {
+        void *bad_ptr = malloc(len + 8);
+        memcpy(bad_ptr, spooky_buf, len + 7);
+      }
+  NEGATIVE_TESTS:
+    - |-
+      main() {
+        void *bad_ptr = malloc(len + 1);
+        memcpy(bad_ptr, spooky_buf, len);
+      }
+
+- DESCRIPTION: |-
+    My modification of Fabian's example:
+
+    Look for malloc($expression) where $expression involves only a single variable (and
+    potentially multiple constants/operations), and a later memcpy involving only the same
+    single variable with a different expression.
+
+    LIMITATIONS: Only catches cases where a single identifier is used in the expression for the
+    allocation, this means multiple variables (or even addition with the result of a function
+    call or a macro) will not show up.
+
+    TODO: Could this be more elegantly expressed using #groupBy to isolate expressions with
+    a single variable?
+  QUERY: |-
+    getCallsTo("malloc").ithArguments("0")
+      .sideEffect { expression = it.code }
+      .filter { it.match { it.type == "Identifier" }.count() == 1 }
+      .sideEffect { variable = it.match { it.type == "Identifier" }.code }
+      .statements().out("REACHES")
+      .match { it.type == "CallExpression" && it.code.startsWith("memcpy") }.ithArguments("2")
+      .filter { it.code != expression }
+      .filter { it.match { it.type == "Identifier" }.count() == 1 }
+      .filter { it.match { it.type == "Identifier" }.code.toList()[0] == variable.toList()[0] }
+  POSITIVE_TESTS:
+    - |-
+      main() {
+        void *bad_ptr = malloc(len + 1);
+        memcpy(bad_ptr, spooky_buf, len);
+      }
+  NEGATIVE_TESTS:
+    - |-
+      main() {
+        void *bad_ptr = malloc(len + MACRO_VALUE);
+        memcpy(bad_ptr, spooky_buf, len);
+      }
