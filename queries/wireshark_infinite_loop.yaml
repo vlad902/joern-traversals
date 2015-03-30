@@ -32,7 +32,7 @@
      + Assumes an assignment, does not work for offset += tvb_...
 
   QUERY: |-
-    getFunctionsByName("tvb_get_*").transform { getCallsTo(it.name) }.scatter()
+    getCallsTo("tvb_get_*")
       .statements()
       .filter { it.defines().count() > 0 }
       .sideEffect { output_var_name = it.defines().toList()[-1].code }
@@ -99,7 +99,10 @@
        it does not cause a bound check, we should check specific parameters.
 
   QUERY: |-
-    getFunctionsByName("tvb_get_*").as('func').out("IS_FUNCTION_OF_AST").out.filter { it.type == "ReturnType" }.filter { it.code.matches(".*int(32|64).*") }.back('func')
+    getFunctionsByName("tvb_get_*").as('func')
+      .out("IS_FUNCTION_OF_AST").out.filter { it.type == "ReturnType" }
+      .filter { it.code.matches(".*int(32|64).*") }
+      .back('func')
       .transform { getCallsTo(it.name) }.scatter()
       .sideEffect { src = it }
       .statements()
