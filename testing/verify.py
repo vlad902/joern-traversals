@@ -1,6 +1,9 @@
 #!/usr/bin/env python2
 #
-# Run query unit tests.
+# Run queries against a database with unit tests loaded. The unit tests are in files
+#  with md5 hashes of their contents so we can cross-reference a test to the results
+#  in the query. Before we run positive/negative unit tests we sanity check that tests
+#  are in the database.
 
 import sys
 import re
@@ -52,11 +55,9 @@ for arg in sys.argv:
       result = j.runGremlinQuery(query)
 
       if not isinstance(result, list):
-        raise Exception("aaa")
+        raise Exception("Result of query for files was not a list")
 
-      # Get the test names by parsing the paths
-      result = map(lambda path: str.split(str(path), "/")[-1], result)
-      result = map(lambda path: str.split(str(path), ".c")[0], result)
+      result = extract_paths(result)
 
       if entry.has_key('POSITIVE_TESTS') and entry['POSITIVE_TESTS']:
         test_names = [hashlib.md5(test).hexdigest() for test in entry['POSITIVE_TESTS']]
