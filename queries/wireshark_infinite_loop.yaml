@@ -151,3 +151,64 @@
           offset += len;
         }
       }
+
+- DESCRIPTION: |-
+    The above query is good for finding cases where an infinite loop is possible by
+    overflowing the offset counter and causing the processing to start-back at the original
+    point; however, it is also possible that we could cause an infinite loop if we could cause
+    the offset to only be incremented by zero. This means looking for loops where the offset
+    is not incremented by fixed amounts and only by used controlled data.
+
+    This query requires a modification to cfgPaths, hence there are no unit tests because they
+    would fail with modifications :/ The modification is to allow specifying the same source and
+    destination node, e.g. making sure that we find no expressions that modify the offset
+    variable in a way that might force it to increment in an entire loop iteration.
+
+    Found https://bugs.wireshark.org/bugzilla/show_bug.cgi?id=11036
+
+    Requires cfgPaths modification:
+    --- a/joern/joernsteps/taintTracking/dataflow.groovy
+    +++ b/joern/joernsteps/taintTracking/dataflow.groovy
+    @@ -127,7 +127,7 @@ Object.metaClass._cfgPaths = {symbol, sanitizer, curNode, dst, visited, path ->
+       }
+
+          // return path when destination has been reached
+          -  if(curNode == dst){
+          +  if (curNode == dst && path != []) {
+
+    Limitations:
+     + We only find the infinite loop case where only a single user-controlled zero variable is
+       added to the offset; however, there could be multiple such zero-value variables.
+
+  QUERY: |-
+    getFunctionsByName("tvb_get_ntohl").transform { getCallsTo(it.name) }.scatter()
+      .sideEffect { offset_var_regex = (it.ithArguments("1").toList()[0].code == 'offset' ? 'offset' : "[oO]ff") }
+      .sideEffect { src = it }
+      .statements()
+      .filter { it.defines().count() > 0 }
+      .sideEffect { output_var_name = it.defines().code.toList()[0].replace("*", "") }
+      .out("REACHES")
+      .match { it.type == "AssignmentExpr" }
+      .filter { it.rval().toList()[0].code.matches(".*$output_var_name.*") }
+      .filter { it.rval().toList()[0].type != 'CallExpression' }
+      .filter { it.rval().toList()[0].type != 'AdditiveExpression' }
+      .filter { it.parents().toList()[0].type != "IdentifierDecl" }
+      .filter { lval = it.lval().toList()[0]; lval.code == 'offset' || (src.ithArguments("1").toList()[0].code != 'offset' && lval.code.matches(".*[oO]ff.*")) }
+      .dedup()
+      .filter { isInLoop(it) }
+      .transform { cfgPaths('FAKEFAKE', { cur, sym ->
+        //println cur._().code.toList();
+        //println cur._().match { it.type == "AssignmentExpr" }.toList();
+        cur._().or(
+          _().match { it.type == "AssignmentExpr" }.filter { it.lval().toList().size > 0 }
+            .filter { it.lval().toList()[0].code.matches(".*$offset_var_regex.*") }
+            .filter { !it.rval().toList()[0].code.matches(".*$output_var_name.*") },
+          _().match { it.type == "IncDecOp" && it.lval().toList().size > 0 }
+            .filter { it.lval.toList()[0].code.matches(".*$offset_var_regex.*") },
+          _().isCheck(".*$output_var_name .*"))
+        }, src.statements().toList()[0], src.statements().toList()[0]) }
+      .scatter().transform { it.toList()[0] }
+      .dedup()
+
+  POSITIVE_TESTS:
+  NEGATIVE_TESTS:
