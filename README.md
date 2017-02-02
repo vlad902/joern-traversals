@@ -1,7 +1,7 @@
 joern-traversals
 -------------
 
-A collection of example [joern](https://github.com/fabsx00/joern) queries with unit tests.
+A collection of example [joern](https://github.com/fabsx00/joern) queries with unit tests. These queries are for the old version of joern that used neo4j and tinkerpop v2, for some examples using octopus (the new update of joern using tinkerpop3 on TitanDB) look [here](https://tsyrklevich.net/2016/10/31/notes-on-octopus-gremlin3/).
 
 Run unit tests
 --------------

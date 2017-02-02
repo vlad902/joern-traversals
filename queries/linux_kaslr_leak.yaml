@@ -1,0 +1,253 @@
+---
+- DESCRIPTION: |-
+    Look at the simplest possible case, inspired by this bug
+    https://git.backbone.ws/linux/backbone-sources/commit/a117dac
+
+    Look at calls to copy_to_user where the data being copied out is a structure allocated as a
+    local stack variable that is not sanitized correctly. Unfortunately joern does not store much
+    useful type information (e.g. searchable struct definitions and elements), so the best we can
+    do is make sure the struct is not sanitized, a second step is required to see if all the
+    individual struct fields are written to. This first step reduces the search space of
+    copy_to_user calls on Linux 4.7.2 from 2491 to 191. Ultimately after narrowing down the
+    number of possible hits was further narrowed down by a post-processing step that looked for
+    structs where all members were assigned to, just one memory leak was found.
+
+    Limitations:
+    - Only looks for calls to copy_to_user() with sizeof() in the length parameter.
+    - Ignores pointers (e.g. dynamically allocated structs, buffers, etc.)
+    - Ignores structs passed in an argument (e.g. we could do some simple interprocedural
+      analysis to look backwards to see if the data was initialized correctly in the calling
+      functions.)
+    - Returns too many results, needs post-processing step due to lack of struct type info.
+
+    Ideas:
+    - Fix any limitation listed above
+    - Look specifically at unsanitized unions involved in a copy_to_user with different width
+      members
+    - Look specifically at unsanitized structs involved in a copy_to_user with members named
+      something like 'padding' or 'reserved'
+    - Look specifically at unsanitized unpacked structs involved in a copy_to_user that would
+      include compiler added padding on 32 or 64-bit platforms
+
+    Found https://github.com/torvalds/linux/commit/02a9079c66341836c4914c33c06a73245060df2e
+
+    This requires a modified reachableCfgNodes to run
+
+    diff --git a/joern/joernsteps/cfg.groovy b/joern/joernsteps/cfg.groovy
+    index 7e8a9a0..2e7c05b 100644
+    --- a/joern/joernsteps/cfg.groovy
+    +++ b/joern/joernsteps/cfg.groovy
+    @@ -12,20 +12,25 @@ Gremlin.defineStep('toExitNode', [Vertex,Pipe], {
+     /**
+        Search the CFG breadth-first so that we can keep track of all nodes we've visited in
+         the entire search rather than just along the current path (massive optimization for
+    -    high branching-factor CFGs, e.g. state machines).
+    +    high branching-factor CFGs, e.g. state machines.) Can search forwards or backwards.
+     */
+    -Object.metaClass._reachableCfgNodes = { curNodes, visited ->
+    -  nextNodes = curNodes._().out('FLOWS_TO').toSet() - visited
+    +Object.metaClass._reachableCfgNodes = { curNodes, visited, forward ->
+    +  if (forward == true) {
+    +    nextNodes = curNodes._().out('FLOWS_TO').toSet() - visited
+    +  } else {
+    +    nextNodes = curNodes._().in('FLOWS_TO').toSet() - visited
+    +  }
+    +
+       if (nextNodes.isEmpty()) { return visited }
+
+       visited.addAll(nextNodes)
+    -  return _reachableCfgNodes(nextNodes.toList(), visited)
+    +  return _reachableCfgNodes(nextNodes.toList(), visited, forward)
+     }
+
+    -Gremlin.defineStep('reachableCfgNodes', [Vertex, Pipe], {
+    -  _().transform { _reachableCfgNodes(it.statements().toList(), new HashSet())}.scatter()
+    +Gremlin.defineStep('reachableCfgNodes', [Vertex, Pipe], { forward ->
+    +  _().transform { _reachableCfgNodes(it.statements().toList(), new HashSet(), forward)}.scatter()
+     })
+
+     Object.metaClass.isInLoop = { it ->
+    -  it._().reachableCfgNodes().toSet().contains(it.statements().toList()[0])
+    +  it._().reachableCfgNodes(true).toSet().contains(it.statements().toList()[0])
+
+  QUERY: |-
+    getCallsTo('copy_to_user')
+      .as('copy')
+      .sideEffect { end_node = it.statements().toList()[0] }
+      .ithArguments('1')
+      .match { it.type == 'Identifier' }
+      .sideEffect { var_name = it.code }
+      .back('copy')
+      .ithArguments('2')
+      // Whole struct is being copied out.
+      .filter { it.codeContains('.*sizeof.*').count() > 0 }
+      .back('copy')
+      // Search backwards to find the declaration
+      .reachableCfgNodes(false)
+      .filter { it.type == 'IdentifierDeclStatement' }
+      .match { it.type == 'Identifier' && it.code == var_name }
+      .back(1)
+      .sideEffect { start_node = it }
+      // If it assigned a value assigned from the beginning, there is no memory leak
+      .filter { !it.astNodes().type.toList().contains('AssignmentExpr') }
+      .match { it.type == 'IdentifierDeclType' && !it.codeContains('^(const )?(float|off_t|compat_int_t|unsigned|s8|s16|s32|s64|u8|u16|u32|u64|__u8|__u16|__u32|__u64|int|unsigned long|unsigned int|u_int16_t|uint32_t|uint64_t|ssize_t|size_t|unsigned char)( const)?$') && !it.codeContains('.*\\*$') }
+      .transform {
+        cfgPaths('FAKE', { cur, sym ->
+          cur._().or(
+            // Ignore code paths that require capabilities
+            _().codeContains('.*capable \\(.*'),
+            // Ignore code paths where the entire variable is written to with memcpy
+            // - hacky, could do this cleaner with AST parsing but I am being lazy. Also
+            // misses cases where sizeof has no parens or its sizeof the type
+            _().codeContains('.*memcpy \\( (& )?' + var_name + ' ,.*sizeof \\( ' + var_name + ' \\).*'),
+            // Ignore code paths where the value is assigned to directly
+            _().match { it.type == 'AssignmentExpr' && it.lval().code.toList().contains(var_name) },
+            // Look for references to 'var' or '& var' passed to a sanitizing functions
+            _().match { it.type == 'CallExpression' }.as('call')
+              .match { it.type == 'Argument' && it.code.matches('(& )?' + var_name) }
+              .sideEffect { arg_num = it.childNum }.back('call')
+              .or(
+                // Simple sanitizers
+                _().callToCallee().codeContains('(memset|copy_from_user)'),
+                // Do some real hacky interprocedural analysis, check if the arg is passed to
+                // a function that appears to memset the argument
+                _().transform {
+                  getFunctionsByName(it.callToCallee().code.first())
+                    .out.match { it.type == 'ParameterList' }
+                    .out.filter { it.childNum == arg_num }
+                    .out('REACHES').codeContains('memset.*')
+                }.scatter()
+              )
+          )
+        }, start_node, end_node)
+      }
+      .scatter()
+
+      // make unit tests happy
+      .transform { it.toList()[0] }
+
+      // pretty-print
+      //.transform {
+      //  [it.first()] + it._().filter { it.uses().code.toList().contains(var_name) }.toList() + [it.last()]
+      //}
+      //.transform { [it.first().id.toString() + '\n'] + it.code.toList() + ["\n\n"] }
+      //.scatter()
+
+  POSITIVE_TESTS:
+    - |-
+      copy_to_user() {}      // Declaration required to be able to search for functions by name in the index
+      main() {
+        struct foo bar;
+        copy_to_user(fake, &bar, sizeof(bar));
+      }
+
+    - |-
+      copy_to_user() {}      // Declaration required to be able to search for functions by name in the index
+      main() {
+        struct foo bar;
+        if (condition) {
+          memset(&bar, 0, sizeof(bar));
+        }
+        copy_to_user(fake, &bar, sizeof(bar));
+      }
+
+  NEGATIVE_TESTS:
+    - |-
+      copy_to_user() {}      // Declaration required to be able to search for functions by name in the index
+      main() {
+        struct foo bar;
+        memset(&bar, 0, sizeof(bar));
+        copy_to_user(fake, &bar, sizeof(bar));
+      }
+
+    - |-
+      copy_to_user() {}      // Declaration required to be able to search for functions by name in the index
+
+      func(void *foo) { memset(foo, 0, sizeof(*foo)); }
+
+      main() {
+        struct foo bar;
+        func(&bar);
+        copy_to_user(fake, &bar, sizeof(bar));
+      }
+
+- DESCRIPTION: |-
+    This performs a similar search to the above, we look for unions or union pointers where the
+    contents of the type are not sanitized. Unions specifically are interesting because of the
+    possibility that different sized types exist within the union and the contents of the entire
+    union are copied out when a code path is hit that only fills part of the union. This search
+    returns 7 results, of which 2 have bugs.
+
+    Found https://github.com/torvalds/linux/commit/30f939feaeee23e21391cfc7b484f012eb189c3c
+    Found https://github.com/torvalds/linux/commit/d69bb92e402ff948bdcd39f19c9067874fb86873
+
+  QUERY: |-
+    getCallsTo('copy_to_user')
+      .as('copy')
+      .sideEffect { end_node = it.statements().toList()[0] }
+      .ithArguments('1')
+      .match { it.type == 'Identifier' }
+      .sideEffect { var_name = it.code }
+      .back('copy')
+      .back('copy')
+      // Search backwards to find the declaration
+      .reachableCfgNodes(false)
+      .filter { it.type == 'IdentifierDeclStatement' }
+      .match { it.type == 'Identifier' && it.code == var_name }
+      .back(1)
+      .sideEffect { start_node = it }
+      // If it assigned a value assigned from the beginning, there is no memory leak
+      .filter { !it.astNodes().type.toList().contains('AssignmentExpr') }
+      .match { it.type == 'IdentifierDeclType' && it.codeContains(".*union.*") }
+      .transform {
+        cfgPaths('FAKE', { cur, sym ->
+          cur._().or(
+            // Ignore code paths that require capabilities
+            _().codeContains('.*capable \\(.*'),
+            _().codeContains('.*' + var_name + '.*=.*(kzalloc|vzalloc|memdup_user).*'),
+            _().codeContains('.*(memset|memcpy).*' + var_name + '.*')
+          )
+        }, start_node, end_node)
+      }
+      .scatter()
+
+      // make unit tests happy
+      .transform { it.toList()[0] }
+
+      // pretty-print
+      //.transform { it._().filter { it.codeContains('.*' + var_name + '.*').count() > 0 }.toList() }
+      //.transform { [it.first().id.toString() + '\n'] + it.code.toList() + ["\n\n"] }
+      //.scatter()
+
+  POSITIVE_TESTS:
+    - |-
+      copy_to_user() {}      // Declaration required to be able to search for functions by name in the index
+      main() {
+        union foo *bar;
+        bar = kmalloc(sizeof(struct foo));
+        copy_to_user(fake, &bar, sizeof(bar));
+      }
+
+    - |-
+      copy_to_user() {}      // Declaration required to be able to search for functions by name in the index
+      main() {
+        union foo bar;
+        copy_to_user(fake, &bar, sizeof(bar));
+      }
+
+  NEGATIVE_TESTS:
+    - |-
+      copy_to_user() {}      // Declaration required to be able to search for functions by name in the index
+      main() {
+        union foo *bar;
+        bar = kzalloc(sizeof(struct foo));
+        copy_to_user(fake, &bar, sizeof(bar));
+      }
+
+    - |-
+      copy_to_user() {}      // Declaration required to be able to search for functions by name in the index
+      main() {
+        union foo bar;
+        memcpy(bar, baz, sizeof(bar));
+        copy_to_user(fake, &bar, sizeof(bar));
+      }
